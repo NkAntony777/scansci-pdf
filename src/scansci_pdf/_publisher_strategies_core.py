@@ -2217,14 +2217,25 @@ def _elsevier_attachment_metadata(el: Any) -> str:
     return " ".join(parts).lower()
 
 
+_ELSEVIER_ACCEPTED_MANUSCRIPT_MARKERS = (
+    "-am.pdf", "aam-pdf", "accepted manuscript", "accepted-manuscript",
+    "author manuscript", "manuscript version", "submitted to",
+)
+
+
 def _elsevier_attachment_score(eid: str, metadata: str) -> int:
+    eid_lower = eid.lower()
     haystack = f"{eid} {metadata}".lower()
     score = 0
-    if eid.lower().endswith(".pdf"):
+    if eid_lower.endswith(".pdf"):
         score += 20
     if "pdf" in haystack:
         score += 10
-    if "main" in haystack or "full-text" in haystack or "fulltext" in haystack:
+    # Scope the version-of-record boost to the object id. Matching "main"
+    # anywhere in the haystack also catches accepted-manuscript attachments:
+    # their storage URLs carry a "/main/" path segment, so an `-am.pdf` picked
+    # up the same +100 and outranked the `-main.pdf` it accompanies (#73).
+    if eid_lower.endswith("-main.pdf") or "full-text" in haystack or "fulltext" in haystack:
         score += 100
     if "page-count" in haystack or "pages" in haystack:
         score += 5
@@ -2234,6 +2245,11 @@ def _elsevier_attachment_score(eid: str, metadata: str) -> int:
         "supplement", "supplementary", "mmc", "appendix", "graphical", "thumbnail",
     )):
         score -= 100
+    if any(marker in haystack for marker in _ELSEVIER_ACCEPTED_MANUSCRIPT_MARKERS):
+        # Below the version of record even if the manuscript claims
+        # "full-text" (+100), yet still above supplementary material (-100) so
+        # a manuscript-only article keeps its best candidate.
+        score -= 60
     return score
 
 
