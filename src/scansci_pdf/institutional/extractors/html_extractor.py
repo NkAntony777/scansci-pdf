@@ -1,31 +1,27 @@
-"""HTML extraction router - dispatches to publisher-specific adapters."""
+"""Re-export the HTML extraction router from the root package.
 
-import logging
+The publisher stack shipped in two copies that drifted apart; this module is
+now a re-export shim over the single implementation in
+``scansci_pdf.extractors.html_extractor``
+(#71 item 5). Keep the implementation there, not here.
+"""
 
-from .publisher_adapters import acs, elsevier, generic, nature, rsc, tandfonline, wiley
+from ...extractors import html_extractor as _canonical
+from ...extractors.html_extractor import (  # noqa: F401
+    extract,
+    _ADAPTERS,
+)
 
-logger = logging.getLogger(__name__)
 
-# Ordered list of publisher adapters (checked in order)
-_ADAPTERS = [nature, elsevier, wiley, acs, rsc, tandfonline]
+def __getattr__(name: str):
+    """Forward anything not re-exported above to the canonical module.
 
-
-def extract(html: str, url: str = "") -> dict:
-    """Extract paper content from HTML, routing to the best adapter.
-
-    Args:
-        html: Raw HTML content.
-        url: The URL the HTML was fetched from (used for publisher detection).
-
-    Returns:
-        Dict with title, authors, abstract, full_text, figures, references.
+    The old copy had the canonical module's own imported names as its
+    attributes too (``requests``, ``time`` and friends), and code that
+    patched or read one of them through this path should keep working.
     """
-    # Try publisher-specific adapters first
-    for adapter in _ADAPTERS:
-        if adapter.can_handle(url):
-            logger.info("Using %s adapter for %s", adapter.__name__, url)
-            return adapter.extract(html, url)
+    return getattr(_canonical, name)
 
-    # Fallback to generic
-    logger.info("Using generic adapter for %s", url)
-    return generic.extract(html, url)
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(dir(_canonical)))
