@@ -151,11 +151,18 @@ class PersistentPoolTests(unittest.TestCase):
                 pool.submit(scihub._close_my_browser).result()
 
             # The foreign task really did resolve the patched attribute ...
-            self.assertEqual(len(calls), 2)
-            # ... this pool's own close is counted ...
-            self.assertEqual(len(_own_close_calls(pool, calls)), 1)
-            # ... and the foreign one is not.
-            self.assertEqual(len(calls) - len(_own_close_calls(pool, calls)), 1)
+            # ... and it is not counted against this pool. The counts are
+            # relative to this pool on purpose: a close task queued by an
+            # earlier test can still be in flight and lands in the same
+            # list, and an absolute count would make this test fail for a
+            # reason that has nothing to do with it.
+            own = _own_close_calls(pool, calls)
+            self.assertEqual(
+                len(own), 1, "the pool's own close was not counted"
+            )
+            self.assertGreaterEqual(
+                len(calls), 2, "the foreign task never resolved the patched attribute"
+            )
         finally:
             release.set()
             foreign.shutdown(wait=False)
