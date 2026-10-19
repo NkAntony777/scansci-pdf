@@ -105,28 +105,169 @@ def _article_eid_to_main_pdf(value: str) -> str:
     return f"{candidate}-main.pdf"
 
 
-def _attachment_container(el: ET.Element, parent_map: dict[ET.Element, ET.Element]) -> ET.Element:
+# Maximum characters of attachment metadata handed to the scorer. The scorer
+# pattern-matches that string, so a container that resolved to a shared
+# ancestor contributes every sibling attachment's markers -- and the
+# ancestor's own tag name, "full-text-retrieval-response" among them, reads
+# as a version-of-record claim (#89). A few KB is far more than one
+# attachment's own metadata needs.
+_ATTACHMENT_METADATA_WINDOW = 4096
+
+
+def _attachment_key(eid: str) -> str:
+    """Normalise an object id to the identity of the attachment it names.
+
+    ``1-s2.0-X-main.pdf`` and the bare article id ``1-s2.0-X`` name the same
+    version of record and share a key; ``1-s2.0-X-am.pdf`` and
+    ``1-s2.0-X-author_2017.pdf`` are different attachments and do not.
+    """
+    key = eid.strip().lower()
+    if key.endswith(".pdf"):
+        key = key[:-4]
+    if key.endswith("-main"):
+        key = key[:-5]
+    return key
+
+
+def _eids_in(el: ET.Element) -> list[str]:
+    """Object ids carried by one element: its own eid text, plus eid attributes."""
+    found: list[str] = []
+    local = _local_name(str(el.tag))
+    if local in {"attachment-eid", "object-eid"}:
+        text = _element_text(el)
+        if _looks_like_pdf_eid(text):
+            found.append(text)
+    elif local in {"eid", "identifier"}:
+        main_pdf = _article_eid_to_main_pdf(_element_text(el))
+        if main_pdf:
+            found.append(main_pdf)
+
+    for attr_name, attr_value in el.attrib.items():
+        attr_local = _local_name(str(attr_name))
+        if attr_local in {"attachment-eid", "object-eid", "eid"}:
+            value = str(attr_value).strip()
+            if _looks_like_pdf_eid(value):
+                found.append(value)
+            else:
+                main_pdf = _article_eid_to_main_pdf(value)
+                if main_pdf:
+                    found.append(main_pdf)
+    return found
+
+
+def _is_attachment_block(node: ET.Element) -> bool:
+    """True for a node that names an attachment rather than holding documents."""
+    local = _local_name(str(node.tag))
+    return "attachment" in local or "object" in local or local == "web-pdf"
+
+
+def _block_is_scoped(node: ET.Element, key: str) -> bool:
+    """True when the node declares no attachment other than ``key``.
+
+    A holder of several attachments -- the plural ``attachments`` element, or
+    an ancestor spanning the whole article -- carries every sibling's
+    metadata, so a sibling's markers leak into this attachment's score (#89).
+    """
+    for sub in node.iter():
+        for eid in _eids_in(sub):
+            if _attachment_key(eid) != key:
+                return False
+    return True
+
+
+def _block_key(node: ET.Element) -> str | None:
+    """The single attachment key a node declares, or None if it declares several.
+
+    A node that declares exactly one attachment is a *tight* block: its
+    metadata describes that attachment alone.
+    """
+    keys: set[str] = set()
+    for sub in node.iter():
+        for eid in _eids_in(sub):
+            keys.add(_attachment_key(eid))
+            if len(keys) > 1:
+                return None
+    return next(iter(keys)) if keys else None
+
+
+def _attachment_blocks(root: ET.Element) -> dict[str, ET.Element]:
+    """Index the tight attachment blocks by the attachment they declare.
+
+    A tight block names an attachment and declares exactly one of them, so its
+    metadata describes that attachment alone. The article-level id sits
+    outside every block, so this index is what describes the version of record
+    it names (#89).
+    """
+    blocks: dict[str, ET.Element] = {}
+    for node in root.iter():
+        if not _is_attachment_block(node):
+            continue
+        key = _block_key(node)
+        if key is not None:
+            blocks.setdefault(key, node)
+    return blocks
+
+
+def _attachment_container(
+    el: ET.Element,
+    parent_map: dict[ET.Element, ET.Element],
+    eid: str,
+    blocks: dict[str, ET.Element],
+) -> ET.Element:
+    """The node whose metadata describes the attachment named by ``eid``.
+
+    Three candidates, in order of how well they describe *this* attachment:
+
+    1. the nearest ancestor of the element that carried the id which names an
+       attachment and declares no other one;
+    2. the tight block elsewhere in the document that declares this id -- the
+       article-level ``<eid>`` sits outside every attachment block, so the
+       version of record it names is described by that block;
+    3. the element that carried the id, which is the tightest scope there is.
+
+    Falling back to the id's *parent*, as this used to, was the defect: the
+    parent can be a node spanning the whole article, and the metadata of such
+    a node belongs to every attachment in it (#89).
+    """
+    key = _attachment_key(eid)
+
     node = parent_map.get(el, el)
     while node is not None:
-        local = _local_name(str(node.tag))
-        if "attachment" in local or "object" in local or local == "web-pdf":
+        if _is_attachment_block(node) and _block_is_scoped(node, key):
             return node
         node = parent_map.get(node)
-    return parent_map.get(el, el)
+
+    block = blocks.get(key)
+    if block is not None:
+        return block
+    return el
 
 
 def _attachment_metadata(el: ET.Element) -> str:
+    """Metadata of an attachment's container, bounded to a few KB.
+
+    The bound matters because this string is what the scorer matches: a
+    pathological container would otherwise inject a sibling attachment's
+    markers into this attachment's haystack (#89).
+    """
     parts: list[str] = []
+    size = 0
     for node in el.iter():
         local = _local_name(str(node.tag))
         text = _element_text(node)
         if text:
-            parts.append(f"{local}:{text}")
+            part = f"{local}:{text}"
+            parts.append(part)
+            size += len(part)
         for attr_name, attr_value in node.attrib.items():
             attr_local = _local_name(str(attr_name))
             if attr_value:
-                parts.append(f"{attr_local}:{attr_value}")
-    return " ".join(parts).lower()
+                part = f"{attr_local}:{attr_value}"
+                parts.append(part)
+                size += len(part)
+        if size >= _ATTACHMENT_METADATA_WINDOW:
+            break
+    return " ".join(parts).lower()[:_ATTACHMENT_METADATA_WINDOW]
 
 
 _ACCEPTED_MANUSCRIPT_MARKERS = (
@@ -174,38 +315,22 @@ def _extract_pdf_attachment_eids(xml_text: str) -> list[str]:
         return []
 
     parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    # Index the tight attachment blocks: a node that names an attachment and
+    # declares exactly one of them. The article-level id sits outside every
+    # block, so this index is what describes the version of record it names.
+    blocks = _attachment_blocks(root)
+
     candidates: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     for el in root.iter():
-        local = _local_name(str(el.tag))
-        found: list[str] = []
-
-        if local in {"attachment-eid", "object-eid"}:
-            text = _element_text(el)
-            if _looks_like_pdf_eid(text):
-                found.append(text)
-        elif local in {"eid", "identifier"}:
-            main_pdf = _article_eid_to_main_pdf(_element_text(el))
-            if main_pdf:
-                found.append(main_pdf)
-
-        for attr_name, attr_value in el.attrib.items():
-            attr_local = _local_name(str(attr_name))
-            if attr_local in {"attachment-eid", "object-eid", "eid"}:
-                value = str(attr_value).strip()
-                if _looks_like_pdf_eid(value):
-                    found.append(value)
-                else:
-                    main_pdf = _article_eid_to_main_pdf(value)
-                    if main_pdf:
-                        found.append(main_pdf)
-
-        for eid in found:
+        for eid in _eids_in(el):
             if eid in seen:
                 continue
             seen.add(eid)
-            metadata = _attachment_metadata(_attachment_container(el, parent_map))
+            container = _attachment_container(el, parent_map, eid, blocks)
+            metadata = _attachment_metadata(container)
             candidates.append((_attachment_score(eid, metadata), len(candidates), eid))
 
     candidates.sort(key=lambda item: (-item[0], item[1]))

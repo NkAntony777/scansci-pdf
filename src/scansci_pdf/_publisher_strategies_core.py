@@ -2193,28 +2193,169 @@ def _elsevier_article_eid_to_main_pdf(value: str) -> str:
     return f"{candidate}-main.pdf"
 
 
-def _elsevier_attachment_container(el: Any, parent_map: dict[Any, Any]) -> Any:
+# Maximum characters of attachment metadata handed to the scorer. The scorer
+# pattern-matches that string, so a container that resolved to a shared
+# ancestor contributes every sibling attachment's markers -- and the
+# ancestor's own tag name, "full-text-retrieval-response" among them, reads
+# as a version-of-record claim (#89). A few KB is far more than one
+# attachment's own metadata needs.
+_ELSEVIER_METADATA_WINDOW = 4096
+
+
+def _elsevier_attachment_key(eid: str) -> str:
+    """Normalise an object id to the identity of the attachment it names.
+
+    ``1-s2.0-X-main.pdf`` and the bare article id ``1-s2.0-X`` name the same
+    version of record and share a key; ``1-s2.0-X-am.pdf`` and
+    ``1-s2.0-X-author_2017.pdf`` are different attachments and do not.
+    """
+    key = eid.strip().lower()
+    if key.endswith(".pdf"):
+        key = key[:-4]
+    if key.endswith("-main"):
+        key = key[:-5]
+    return key
+
+
+def _elsevier_eids_in(el: Any) -> list[str]:
+    """Object ids carried by one element: its own eid text, plus eid attributes."""
+    found: list[str] = []
+    local = _elsevier_xml_local_name(str(el.tag))
+    if local in {"attachment-eid", "object-eid"}:
+        text = _elsevier_element_text(el)
+        if _elsevier_looks_like_pdf_eid(text):
+            found.append(text)
+    elif local in {"eid", "identifier"}:
+        main_pdf = _elsevier_article_eid_to_main_pdf(_elsevier_element_text(el))
+        if main_pdf:
+            found.append(main_pdf)
+
+    for attr_name, attr_value in el.attrib.items():
+        attr_local = _elsevier_xml_local_name(str(attr_name))
+        if attr_local in {"attachment-eid", "object-eid", "eid"}:
+            value = str(attr_value).strip()
+            if _elsevier_looks_like_pdf_eid(value):
+                found.append(value)
+            else:
+                main_pdf = _elsevier_article_eid_to_main_pdf(value)
+                if main_pdf:
+                    found.append(main_pdf)
+    return found
+
+
+def _elsevier_is_attachment_block(node: Any) -> bool:
+    """True for a node that names an attachment rather than holding documents."""
+    local = _elsevier_xml_local_name(str(node.tag))
+    return "attachment" in local or "object" in local or local == "web-pdf"
+
+
+def _elsevier_block_is_scoped(node: Any, key: str) -> bool:
+    """True when the node declares no attachment other than ``key``.
+
+    A holder of several attachments -- the plural ``attachments`` element, or
+    an ancestor spanning the whole article -- carries every sibling's
+    metadata, so a sibling's markers leak into this attachment's score (#89).
+    """
+    for sub in node.iter():
+        for eid in _elsevier_eids_in(sub):
+            if _elsevier_attachment_key(eid) != key:
+                return False
+    return True
+
+
+def _elsevier_block_key(node: Any) -> str | None:
+    """The single attachment key a node declares, or None if it declares several.
+
+    A node that declares exactly one attachment is a *tight* block: its
+    metadata describes that attachment alone.
+    """
+    keys: set[str] = set()
+    for sub in node.iter():
+        for eid in _elsevier_eids_in(sub):
+            keys.add(_elsevier_attachment_key(eid))
+            if len(keys) > 1:
+                return None
+    return next(iter(keys)) if keys else None
+
+
+def _elsevier_attachment_blocks(root: Any) -> dict[str, Any]:
+    """Index the tight attachment blocks by the attachment they declare.
+
+    A tight block names an attachment and declares exactly one of them, so its
+    metadata describes that attachment alone. The article-level id sits
+    outside every block, so this index is what describes the version of record
+    it names (#89).
+    """
+    blocks: dict[str, Any] = {}
+    for node in root.iter():
+        if not _elsevier_is_attachment_block(node):
+            continue
+        key = _elsevier_block_key(node)
+        if key is not None:
+            blocks.setdefault(key, node)
+    return blocks
+
+
+def _elsevier_attachment_container(
+    el: Any,
+    parent_map: dict[Any, Any],
+    eid: str,
+    blocks: dict[str, Any],
+) -> Any:
+    """The node whose metadata describes the attachment named by ``eid``.
+
+    Three candidates, in order of how well they describe *this* attachment:
+
+    1. the nearest ancestor of the element that carried the id which names an
+       attachment and declares no other one;
+    2. the tight block elsewhere in the document that declares this id -- the
+       article-level ``<eid>`` sits outside every attachment block, so the
+       version of record it names is described by that block;
+    3. the element that carried the id, which is the tightest scope there is.
+
+    Falling back to the id's *parent*, as this used to, was the defect: the
+    parent can be a node spanning the whole article, and the metadata of such
+    a node belongs to every attachment in it (#89).
+    """
+    key = _elsevier_attachment_key(eid)
+
     node = parent_map.get(el, el)
     while node is not None:
-        local = _elsevier_xml_local_name(str(node.tag))
-        if "attachment" in local or "object" in local:
+        if _elsevier_is_attachment_block(node) and _elsevier_block_is_scoped(node, key):
             return node
         node = parent_map.get(node)
-    return parent_map.get(el, el)
+
+    block = blocks.get(key)
+    if block is not None:
+        return block
+    return el
 
 
 def _elsevier_attachment_metadata(el: Any) -> str:
+    """Metadata of an attachment's container, bounded to a few KB.
+
+    The bound matters because this string is what the scorer matches: a
+    pathological container would otherwise inject a sibling attachment's
+    markers into this attachment's haystack (#89).
+    """
     parts: list[str] = []
+    size = 0
     for node in el.iter():
         local = _elsevier_xml_local_name(str(node.tag))
         text = _elsevier_element_text(node)
         if text:
-            parts.append(f"{local}:{text}")
+            part = f"{local}:{text}"
+            parts.append(part)
+            size += len(part)
         for attr_name, attr_value in node.attrib.items():
             attr_local = _elsevier_xml_local_name(str(attr_name))
             if attr_value:
-                parts.append(f"{attr_local}:{attr_value}")
-    return " ".join(parts).lower()
+                part = f"{attr_local}:{attr_value}"
+                parts.append(part)
+                size += len(part)
+        if size >= _ELSEVIER_METADATA_WINDOW:
+            break
+    return " ".join(parts).lower()[:_ELSEVIER_METADATA_WINDOW]
 
 
 _ELSEVIER_ACCEPTED_MANUSCRIPT_MARKERS = (
@@ -2264,38 +2405,21 @@ def _extract_elsevier_pdf_attachment_eids(xml_text: str) -> list[str]:
         return []
 
     parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    # Index the tight attachment blocks: a node that names an attachment and
+    # declares exactly one of them. The article-level id sits outside every
+    # block, so this index is what describes the version of record it names.
+    blocks = _elsevier_attachment_blocks(root)
+
     candidates: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     for el in root.iter():
-        found: list[str] = []
-        local = _elsevier_xml_local_name(str(el.tag))
-        if local in {"attachment-eid", "object-eid"}:
-            text = _elsevier_element_text(el)
-            if _elsevier_looks_like_pdf_eid(text):
-                found.append(text)
-        elif local in {"eid", "identifier"}:
-            text = _elsevier_element_text(el)
-            main_pdf = _elsevier_article_eid_to_main_pdf(text)
-            if main_pdf:
-                found.append(main_pdf)
-
-        for attr_name, attr_value in el.attrib.items():
-            attr_local = _elsevier_xml_local_name(str(attr_name))
-            if attr_local in {"attachment-eid", "object-eid", "eid"}:
-                value = str(attr_value).strip()
-                if _elsevier_looks_like_pdf_eid(value):
-                    found.append(value)
-                else:
-                    main_pdf = _elsevier_article_eid_to_main_pdf(value)
-                    if main_pdf:
-                        found.append(main_pdf)
-
-        for eid in found:
+        for eid in _elsevier_eids_in(el):
             if eid in seen:
                 continue
             seen.add(eid)
-            container = _elsevier_attachment_container(el, parent_map)
+            container = _elsevier_attachment_container(el, parent_map, eid, blocks)
             metadata = _elsevier_attachment_metadata(container)
             candidates.append((
                 _elsevier_attachment_score(eid, metadata),
