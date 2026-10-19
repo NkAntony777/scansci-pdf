@@ -120,11 +120,15 @@ ACS_PROFILE = PublisherProfile(
         "/sso/",
         "/login",
     ),
+    # "Tsinghua" must not be a title marker: an entitled Tsinghua article page
+    # carries it in its <title>, and matching it there would classify the page
+    # as logged out before the body-based session check can run. The IdP pages
+    # that really need detecting are caught by auth_url_markers above.
     auth_title_markers=(
-        "Tsinghua",
         "OpenAthens",
         "Identity",
         "Login",
+        "Sign In",
     ),
     sso_text_markers=(
         "access through",

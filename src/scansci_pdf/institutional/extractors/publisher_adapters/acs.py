@@ -4,32 +4,31 @@ The publisher stack shipped in two copies that drifted apart; this module is
 now a re-export shim over the single implementation in
 ``scansci_pdf.extractors.publisher_adapters.acs``
 (#71 item 5). Keep the implementation there, not here.
+
+Nothing is bound at import time. A reload of the canonical module replaces its
+function objects, and a shim that captured them at import time would keep
+handing back the stale ones -- so every name is resolved through
+``__getattr__`` instead, and ``__all__`` is derived from the canonical module
+on demand.
 """
 
 from ....extractors.publisher_adapters import acs as _canonical
-from ....extractors.publisher_adapters.acs import (  # noqa: F401
-    can_handle,
-    extract,
-    _clean,
-    _extract_abstract,
-    _extract_authors,
-    _extract_body,
-    _extract_figures,
-    _extract_references,
-    _extract_table,
-    _extract_title,
-)
 
 
 def __getattr__(name: str):
-    """Forward anything not re-exported above to the canonical module.
+    """Resolve every name through the canonical module.
 
-    The old copy had the canonical module's own imported names as its
-    attributes too (``requests``, ``time`` and friends), and code that
-    patched or read one of them through this path should keep working.
+    The old copy exposed the canonical module''s own imported names as its
+    attributes too (``requests``, ``time`` and friends), and code that patched
+    or read one of them through this path must keep working.
     """
-    return getattr(_canonical, name)
+    if name == "__all__":
+        return [n for n in dir(_canonical) if not n.startswith("_")]
+    try:
+        return getattr(_canonical, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(dir(_canonical)))
+    return sorted(set(dir(_canonical)) | {"__getattr__", "__dir__", "__all__"})

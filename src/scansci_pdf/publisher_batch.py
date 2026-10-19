@@ -282,14 +282,21 @@ class PublisherBatchDownloader:
         pdf_timeout_sec: int = 60,
         post_login_hold_sec: int = 0,
         post_run_hold_sec: int = 0,
+        require_interactive_browser: bool = False,
     ) -> None:
-        self.config = config or load_config()
+        self.config = load_config() if config is None else config
         self.profile = profile
         self.institution_query = institution_query.strip()
         self.login_timeout_sec = login_timeout_sec
         self.pdf_timeout_ms = max(1, pdf_timeout_sec) * 1_000
         self.post_login_hold_sec = max(0, int(post_login_hold_sec or 0))
         self.post_run_hold_sec = max(0, int(post_run_hold_sec or 0))
+        # The institutional downloader this implementation replaced always
+        # launched a *visible* browser, because its login flow is a manual
+        # SSO/2FA round trip. Callers that come from that path set this flag
+        # so that ``browser_headless`` in the config cannot turn the login
+        # into one a headless browser cannot complete.
+        self.require_interactive_browser = bool(require_interactive_browser)
         # Set True by _run_once/_run_once_parallel when IP_BLOCK_STOP_THRESHOLD
         # consecutive ip_blocked results trip an auto-stop. Read by run_records.
         self._ip_block_stopped: bool = False
@@ -906,6 +913,17 @@ class PublisherBatchDownloader:
         config = dict(self.config)
         if proxy:
             config["browser_static_proxy"] = proxy
+        if getattr(self, "require_interactive_browser", False):
+            # This flow drives a manual SSO/2FA login, which a headless browser
+            # cannot complete. The institutional downloader this replaced was
+            # always visible, so keep it that way regardless of the config.
+            if config.get("browser_headless"):
+                logger.info(
+                    "require_interactive_browser: forcing a visible browser "
+                    "(browser_headless=%s) for the interactive login",
+                    config.get("browser_headless"),
+                )
+            config["browser_headless"] = False
         ctx = get_persistent_context(profile_path, config)
         # Record the binding so _fetch_pdf_url can route plain-HTTP requests
         # through the same proxy as this context's browser traffic.
