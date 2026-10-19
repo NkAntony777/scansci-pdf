@@ -2193,27 +2193,389 @@ def _elsevier_article_eid_to_main_pdf(value: str) -> str:
     return f"{candidate}-main.pdf"
 
 
-def _elsevier_attachment_container(el: Any, parent_map: dict[Any, Any]) -> Any:
-    node = parent_map.get(el, el)
+# Maximum characters of attachment metadata handed to the scorer. The scorer
+# pattern-matches that string, so a container that resolved to a shared
+# ancestor contributes every sibling attachment's markers -- and the
+# ancestor's own tag name, "full-text-retrieval-response" among them, reads
+# as a version-of-record claim (#89). A few KB is far more than one
+# attachment's own metadata needs.
+_ELSEVIER_METADATA_WINDOW = 4096
+
+# Maximum characters taken from a single element's text. Without it one long
+# element (a 5,000-character label) fills the whole window and pushes the
+# block's *own* markers out of it -- which costs the version of record its
+# own "full-text" claim.
+_ELSEVIER_METADATA_PART_CAP = 512
+
+# Elements that name an object id rather than hold attachment content.
+_ELSEVIER_ID_TAGS = frozenset({"attachment-eid", "object-eid", "eid", "identifier"})
+
+# Elements that describe one attachment. The loose "attachment" in the tag
+# name would also match "attachment-size" and "attachment-metadata", which
+# describe nothing, so the index uses this explicit list.
+_ELSEVIER_BLOCK_TAGS = frozenset({
+    "attachment", "attachments", "object", "objects", "web-pdf",
+})
+
+
+def _elsevier_attachment_key(eid: str) -> str:
+    """Normalise an object id to the identity of the attachment it names.
+
+    ``1-s2.0-X-main.pdf`` and the bare article id ``1-s2.0-X`` name the same
+    version of record and share a key; ``1-s2.0-X-am.pdf`` and
+    ``1-s2.0-X-author_2017.pdf`` are different attachments and do not.
+    """
+    key = eid.strip().lower()
+    if key.endswith(".pdf"):
+        key = key[:-4]
+    if key.endswith("-main"):
+        key = key[:-5]
+    return key
+
+
+def _elsevier_eids_in(el: Any) -> list[str]:
+    """Object ids carried by one element: its own eid text, plus eid attributes."""
+    found: list[str] = []
+    local = _elsevier_xml_local_name(str(el.tag))
+    if local in {"attachment-eid", "object-eid"}:
+        text = _elsevier_element_text(el)
+        if _elsevier_looks_like_pdf_eid(text):
+            found.append(text)
+    elif local in {"eid", "identifier"}:
+        main_pdf = _elsevier_article_eid_to_main_pdf(_elsevier_element_text(el))
+        if main_pdf:
+            found.append(main_pdf)
+
+    for attr_name, attr_value in el.attrib.items():
+        attr_local = _elsevier_xml_local_name(str(attr_name))
+        if attr_local in {"attachment-eid", "object-eid", "eid"}:
+            value = str(attr_value).strip()
+            if _elsevier_looks_like_pdf_eid(value):
+                found.append(value)
+            else:
+                main_pdf = _elsevier_article_eid_to_main_pdf(value)
+                if main_pdf:
+                    found.append(main_pdf)
+    return found
+
+
+def _elsevier_is_attachment_block(node: Any) -> bool:
+    """True for a node that holds attachment content rather than naming an id.
+
+    ``<attachment-eid>`` and ``<object-eid>`` name an object; they do not
+    hold one, and treating them as blocks would stop the walk at an element
+    whose metadata is nothing but the id.
+    """
+    local = _elsevier_xml_local_name(str(node.tag))
+    if local in _ELSEVIER_ID_TAGS:
+        return False
+    return "attachment" in local or "object" in local or local == "web-pdf"
+
+
+def _elsevier_is_block_element(node: Any) -> bool:
+    """True for the element that describes one attachment.
+
+    The loose test above would also match ``<attachment-size>`` and
+    ``<attachment-metadata>``, which describe nothing, so the block index
+    uses this explicit list instead.
+    """
+    return _elsevier_xml_local_name(str(node.tag)) in _ELSEVIER_BLOCK_TAGS
+
+
+def _elsevier_has_block_descendant(node: Any) -> bool:
+    """True when the node holds another block: it is a holder, not a block.
+
+    ``<attachments><attachment>...</attachment></attachments>`` is a holder.
+    Its metadata belongs to every attachment inside it, so it must never be
+    used as the container of one of them (#89).
+    """
+    for sub in node.iter():
+        if sub is node:
+            continue
+        if _elsevier_is_block_element(sub):
+            return True
+    return False
+
+
+def _elsevier_declared_eids(node: Any) -> list[str]:
+    """Every object id declared inside ``node``."""
+    found: list[str] = []
+    for sub in node.iter():
+        found.extend(_elsevier_eids_in(sub))
+    return found
+
+
+def _elsevier_declares_file_id(node: Any) -> bool:
+    """True when the node names a file id itself.
+
+    The article id (``<eid>1-s2.0-X</eid>``) is turned into ``-main.pdf`` on
+    the way in, so a block that only carries the article id describes the
+    file less precisely than one that names the file id itself.
+    """
+    for sub in node.iter():
+        local = _elsevier_xml_local_name(str(sub.tag))
+        if local in {"attachment-eid", "object-eid"}:
+            if _elsevier_looks_like_pdf_eid(_elsevier_element_text(sub)):
+                return True
+        for attr_name, attr_value in sub.attrib.items():
+            attr_local = _elsevier_xml_local_name(str(attr_name))
+            if attr_local not in {"attachment-eid", "object-eid"}:
+                continue
+            if _elsevier_looks_like_pdf_eid(str(attr_value).strip()):
+                return True
+    return False
+
+
+def _elsevier_block_is_tight(node: Any) -> bool:
+    """True when the node declares exactly one attachment.
+
+    Declarations are counted, not normalised keys: the article-level id and
+    the ``-main.pdf`` id name the same version of record, so a holder of two
+    blocks that normalise to one key would pass a key count while still
+    carrying the sibling's metadata.
+    """
+    return len(_elsevier_declared_eids(node)) == 1
+
+
+def _elsevier_block_is_scoped(node: Any, key: str) -> bool:
+    """True when the node declares no attachment other than ``key``.
+
+    A holder of several attachments -- the plural ``attachments`` element, or
+    an ancestor spanning the whole article -- carries every sibling's
+    metadata, so a sibling's markers leak into this attachment's score (#89).
+    """
+    for eid in _elsevier_declared_eids(node):
+        if _elsevier_attachment_key(eid) != key:
+            return False
+    return True
+
+
+def _elsevier_block_declares(node: Any, key: str) -> bool:
+    """True when the node declares the attachment ``key``.
+
+    Unlike :func:`_elsevier_block_is_scoped` this tolerates a block that also
+    holds something else -- a nested ``<object>``, say. The block's own label
+    still names the file, and losing it would turn an accepted manuscript
+    back into an ordinary candidate.
+    """
+    for eid in _elsevier_declared_eids(node):
+        if _elsevier_attachment_key(eid) == key:
+            return True
+    return False
+
+
+def _elsevier_attachment_blocks(root: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Index the tight attachment blocks by the attachment they declare.
+
+    Two indexes come back:
+
+    - by the exact object id a block declares, which names the file itself
+      and is therefore the strongest match;
+    - by the normalised attachment key, for the blocks that declare the
+      article id instead of a file id.
+
+    Only *tight* blocks are indexed, and never a holder: a node that
+    declares more than one attachment describes more than one attachment,
+    and a node that holds other blocks describes all of them (#89). A block
+    that names the file id wins over one that merely carries the article
+    id, because it describes the file more precisely.
+    """
+    found: list[tuple[str, Any, bool]] = []
+    for node in root.iter():
+        if not _elsevier_is_block_element(node):
+            continue
+        if _elsevier_has_block_descendant(node):
+            continue
+        eids = _elsevier_declared_eids(node)
+        if len(eids) != 1:
+            continue
+        found.append((eids[0], node, _elsevier_declares_file_id(node)))
+
+    by_eid: dict[str, Any] = {}
+    by_key: dict[str, Any] = {}
+    for names_file in (True, False):
+        for eid, node, is_file_id in found:
+            if is_file_id != names_file:
+                continue
+            by_eid.setdefault(eid.strip().lower(), node)
+            by_key.setdefault(_elsevier_attachment_key(eid), node)
+    return by_eid, by_key
+
+
+def _elsevier_attachment_container(
+    el: Any,
+    parent_map: dict[Any, Any],
+    eid: str,
+    blocks: tuple[dict[str, Any], dict[str, Any]],
+) -> Any:
+    """The node whose metadata describes the attachment named by ``eid``.
+
+    Five candidates, in order of how well they describe *this* attachment:
+
+    1. the tight block that declares this exact object id -- the strongest
+       match, because it names the file rather than the article;
+    2. the nearest ancestor of the element that carried the id which holds
+       exactly one attachment, and that one;
+    3. the nearest ancestor that declares this attachment at all -- the block
+       may also hold a nested object, but its own label still names the file;
+    4. the tight block that declares this attachment's key, for the article
+       id that sits outside every attachment block;
+    5. the element that carried the id, which is the tightest scope there is.
+
+    Falling back to the id's *parent*, as this used to, was the defect: the
+    parent can be a node spanning the whole article, and the metadata of such
+    a node belongs to every attachment in it (#89).
+    """
+    key = _elsevier_attachment_key(eid)
+
+    by_eid, by_key = blocks
+    block = by_eid.get(eid.strip().lower())
+    if block is not None:
+        return block
+
+    node = el
     while node is not None:
-        local = _elsevier_xml_local_name(str(node.tag))
-        if "attachment" in local or "object" in local:
+        if (
+            _elsevier_is_attachment_block(node)
+            and _elsevier_block_is_tight(node)
+            and _elsevier_block_is_scoped(node, key)
+        ):
             return node
         node = parent_map.get(node)
-    return parent_map.get(el, el)
+
+    node = el
+    while node is not None:
+        if _elsevier_is_attachment_block(node) and _elsevier_block_declares(node, key):
+            return node
+        node = parent_map.get(node)
+
+    block = by_key.get(key)
+    if block is not None:
+        return block
+    return el
+
+
+_ELSEVIER_METADATA_MARKERS = (
+    # The claims the scorer reads out of the metadata. The window and the
+    # per-element cap bound how much of a container reaches the scorer, so a
+    # marker they cut away would change the score by up to 100 points. They
+    # are therefore collected over the full text and appended.
+    "full-text", "fulltext",
+    "page-count", "pages",
+    "attachment-size", "filesize", "file-size",
+    "supplement", "supplementary", "mmc", "appendix", "graphical", "thumbnail",
+    "-am.pdf", "aam-pdf", "accepted manuscript", "accepted-manuscript",
+    "author manuscript", "manuscript version", "submitted to",
+)
+
+
+def _elsevier_marker_hits(text: str) -> list[str]:
+    """The decisive markers present in `text`."""
+    low = text.lower()
+    return [marker for marker in _ELSEVIER_METADATA_MARKERS if marker in low]
+
+
+def _elsevier_marker_survivors(text: str) -> str:
+    """The decisive markers present in `text`, as a compact tail.
+
+    A marker that falls outside the metadata window, or one the per-element
+    cap cuts in half, would silently change the score -- up to 100 points for
+    the version of record's own "full-text" claim. Collecting the markers
+    over the full text and appending them keeps the window a bound on the
+    size of the metadata rather than on what it says.
+    """
+    hits = _elsevier_marker_hits(text)
+    if not hits:
+        return ""
+    return "[markers: " + " ".join(hits) + "]"
+
+
+def _elsevier_name_survivors(el: Any) -> str:
+    """The decisive markers carried by the container's element names.
+
+    An element's name -- "page-count", "attachment-size" -- reaches the
+    haystack only through the part it produces, and the builder produces a
+    part only for an element that has text. Reading the name of an element
+    that produced no part would add a marker no version of the metadata
+    ever held: an empty ``<supplementary-material/>`` would demote the
+    version of record on its own.
+
+    The attribute names and values are read the same way -- the builder
+    emits an attribute part only for a non-empty value -- so the survivors
+    are exactly the markers the unbounded metadata holds.
+    """
+    hits: list[str] = []
+    for node in el.iter():
+        local = _elsevier_xml_local_name(str(node.tag))
+        name_hits = _elsevier_marker_hits(local)
+        if name_hits and _elsevier_element_text(node):
+            hits.extend(name_hits)
+        for attr_name, attr_value in node.attrib.items():
+            attr_local = _elsevier_xml_local_name(str(attr_name))
+            if attr_value:
+                hits.extend(_elsevier_marker_hits(attr_local))
+                hits.extend(_elsevier_marker_hits(str(attr_value)))
+    if not hits:
+        return ""
+    return "[markers: " + " ".join(sorted(set(hits))) + "]"
+
+
+def _elsevier_cap_text(text: str) -> str:
+    """Shorten one element's text to the per-element cap.
+
+    The beginning is kept: the markers the scorer reads ("supplementary",
+    "thumbnail", "accepted manuscript") sit at the head of a label, and a cut
+    through the middle of one would leave the scorer a word it cannot match.
+    A cut that does land inside a marker is repaired by appending the
+    markers the full text holds, so a marker is never truncated into
+    something the scorer cannot read.
+    """
+    if len(text) <= _ELSEVIER_METADATA_PART_CAP:
+        return text
+    cut = text[:_ELSEVIER_METADATA_PART_CAP]
+    space = cut.rfind(" ")
+    if space > _ELSEVIER_METADATA_PART_CAP // 2:
+        cut = cut[:space]
+    survivors = _elsevier_marker_survivors(text)
+    return f"{cut} {survivors}" if survivors else cut
 
 
 def _elsevier_attachment_metadata(el: Any) -> str:
+    """Metadata of an attachment's container, bounded to a few KB.
+
+    Two bounds apply. The total keeps a pathological container from filling
+    the scorer's haystack; the per-element cap keeps one long element from
+    pushing the block's own markers out of the window, which would cost the
+    version of record its own "full-text" claim.
+
+    The bounds are a bound on size, not on meaning: the markers the scorer
+    reads are collected over the whole container and appended, so a marker
+    the window or the cap would have cut away cannot change the score.
+    """
     parts: list[str] = []
+    size = 0
     for node in el.iter():
         local = _elsevier_xml_local_name(str(node.tag))
         text = _elsevier_element_text(node)
         if text:
-            parts.append(f"{local}:{text}")
+            part = f"{local}:{_elsevier_cap_text(text)}"
+            if size + len(part) + 1 > _ELSEVIER_METADATA_WINDOW:
+                break
+            parts.append(part)
+            size += len(part) + 1
         for attr_name, attr_value in node.attrib.items():
             attr_local = _elsevier_xml_local_name(str(attr_name))
             if attr_value:
-                parts.append(f"{attr_local}:{attr_value}")
+                part = f"{attr_local}:{attr_value}"
+                if size + len(part) + 1 > _ELSEVIER_METADATA_WINDOW:
+                    break
+                parts.append(part)
+                size += len(part) + 1
+        if size >= _ELSEVIER_METADATA_WINDOW:
+            break
+    names = _elsevier_name_survivors(el)
+    if names:
+        parts.append(names)
     return " ".join(parts).lower()
 
 
@@ -2264,38 +2626,25 @@ def _extract_elsevier_pdf_attachment_eids(xml_text: str) -> list[str]:
         return []
 
     parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    # Index the tight attachment blocks: a node that names an attachment and
+    # declares exactly one of them. The article-level id sits outside every
+    # block, so this index is what describes the version of record it names.
+    blocks = _elsevier_attachment_blocks(root)
+
     candidates: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     for el in root.iter():
-        found: list[str] = []
-        local = _elsevier_xml_local_name(str(el.tag))
-        if local in {"attachment-eid", "object-eid"}:
-            text = _elsevier_element_text(el)
-            if _elsevier_looks_like_pdf_eid(text):
-                found.append(text)
-        elif local in {"eid", "identifier"}:
-            text = _elsevier_element_text(el)
-            main_pdf = _elsevier_article_eid_to_main_pdf(text)
-            if main_pdf:
-                found.append(main_pdf)
-
-        for attr_name, attr_value in el.attrib.items():
-            attr_local = _elsevier_xml_local_name(str(attr_name))
-            if attr_local in {"attachment-eid", "object-eid", "eid"}:
-                value = str(attr_value).strip()
-                if _elsevier_looks_like_pdf_eid(value):
-                    found.append(value)
-                else:
-                    main_pdf = _elsevier_article_eid_to_main_pdf(value)
-                    if main_pdf:
-                        found.append(main_pdf)
-
-        for eid in found:
-            if eid in seen:
+        for eid in _elsevier_eids_in(el):
+            # De-duplicate on the attachment identity, not on the spelling:
+            # "1-S2.0-X-MAIN.PDF" and "1-s2.0-x-main.pdf" are one file, and
+            # asking the object store for it twice wastes a request.
+            key = _elsevier_attachment_key(eid)
+            if key in seen:
                 continue
-            seen.add(eid)
-            container = _elsevier_attachment_container(el, parent_map)
+            seen.add(key)
+            container = _elsevier_attachment_container(el, parent_map, eid, blocks)
             metadata = _elsevier_attachment_metadata(container)
             candidates.append((
                 _elsevier_attachment_score(eid, metadata),
