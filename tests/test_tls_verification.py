@@ -59,15 +59,25 @@ def test_shared_retry_path_keeps_verification_on_with_proxy_env(monkeypatch):
 
 
 def test_institutional_retry_path_keeps_verification_on_with_proxy_env(monkeypatch):
+    """The institutional path is a shim over the canonical module.
+
+    Reloading the shim would only re-execute the shim, and the value it
+    reads is the canonical module's already-computed one -- the test would
+    prove nothing. The decision has to be re-made in the canonical module,
+    which is where the code that makes it lives; the shim then has to hand
+    back that same value.
+    """
+    from scansci_pdf import http_utils
     from scansci_pdf.institutional import http_utils as institutional_http_utils
 
     for key, value in PROXY_ENV.items():
         monkeypatch.setenv(key, value)
-    reloaded = importlib.reload(institutional_http_utils)
     try:
-        assert reloaded._SSL_VERIFY is True
+        importlib.reload(http_utils)
+        assert institutional_http_utils._SSL_VERIFY is True
+        assert http_utils._SSL_VERIFY is True
     finally:
-        importlib.reload(institutional_http_utils)
+        importlib.reload(http_utils)
 
 
 def test_request_with_retry_forwards_verify_true(monkeypatch):
