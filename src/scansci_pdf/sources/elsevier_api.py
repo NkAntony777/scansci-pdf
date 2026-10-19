@@ -367,12 +367,69 @@ def _attachment_container(
     return el
 
 
+_ATTACHMENT_METADATA_MARKERS = (
+    # The claims the scorer reads out of the metadata. The window and the
+    # per-element cap bound how much of a container reaches the scorer, so a
+    # marker they cut away would change the score by up to 100 points. They
+    # are therefore collected over the full text and appended.
+    "full-text", "fulltext",
+    "page-count", "pages",
+    "attachment-size", "filesize", "file-size",
+    "supplement", "supplementary", "mmc", "appendix", "graphical", "thumbnail",
+    "-am.pdf", "aam-pdf", "accepted manuscript", "accepted-manuscript",
+    "author manuscript", "manuscript version", "submitted to",
+)
+
+
+def _marker_hits(text: str) -> list[str]:
+    """The decisive markers present in `text`."""
+    low = text.lower()
+    return [marker for marker in _ATTACHMENT_METADATA_MARKERS if marker in low]
+
+
+def _marker_survivors(text: str) -> str:
+    """The decisive markers present in `text`, as a compact tail.
+
+    A marker that falls outside the metadata window, or one the per-element
+    cap cuts in half, would silently change the score -- up to 100 points for
+    the version of record's own "full-text" claim. Collecting the markers
+    over the full text and appending them keeps the window a bound on the
+    size of the metadata rather than on what it says.
+    """
+    hits = _marker_hits(text)
+    if not hits:
+        return ""
+    return "[markers: " + " ".join(hits) + "]"
+
+
+def _name_survivors(el: ET.Element) -> str:
+    """The decisive markers carried by the container's element names.
+
+    An element's name -- "page-count", "attachment-size" -- reaches the
+    haystack only through the part it produces, so an element the window
+    drops takes its name with it. The names are collected over the whole
+    subtree, which is cheap: no text is materialised.
+    """
+    hits: list[str] = []
+    for node in el.iter():
+        hits.extend(_marker_hits(_local_name(str(node.tag))))
+        for attr_name, attr_value in node.attrib.items():
+            hits.extend(_marker_hits(_local_name(str(attr_name))))
+            hits.extend(_marker_hits(str(attr_value)))
+    if not hits:
+        return ""
+    return "[markers: " + " ".join(sorted(set(hits))) + "]"
+
+
 def _cap_text(text: str) -> str:
     """Shorten one element's text to the per-element cap.
 
     The beginning is kept: the markers the scorer reads ("supplementary",
     "thumbnail", "accepted manuscript") sit at the head of a label, and a cut
     through the middle of one would leave the scorer a word it cannot match.
+    A cut that does land inside a marker is repaired by appending the
+    markers the full text holds, so a marker is never truncated into
+    something the scorer cannot read.
     """
     if len(text) <= _ATTACHMENT_METADATA_PART_CAP:
         return text
@@ -380,7 +437,8 @@ def _cap_text(text: str) -> str:
     space = cut.rfind(" ")
     if space > _ATTACHMENT_METADATA_PART_CAP // 2:
         cut = cut[:space]
-    return cut
+    survivors = _marker_survivors(text)
+    return f"{cut} {survivors}" if survivors else cut
 
 
 def _attachment_metadata(el: ET.Element) -> str:
@@ -391,8 +449,9 @@ def _attachment_metadata(el: ET.Element) -> str:
     pushing the block's own markers out of the window, which would cost the
     version of record its own "full-text" claim.
 
-    Parts are never cut in half: a part that does not fit is dropped whole,
-    so a marker is never truncated into something the scorer cannot read.
+    The bounds are a bound on size, not on meaning: the markers the scorer
+    reads are collected over the whole container and appended, so a marker
+    the window or the cap would have cut away cannot change the score.
     """
     parts: list[str] = []
     size = 0
@@ -415,6 +474,9 @@ def _attachment_metadata(el: ET.Element) -> str:
                 size += len(part) + 1
         if size >= _ATTACHMENT_METADATA_WINDOW:
             break
+    names = _name_survivors(el)
+    if names:
+        parts.append(names)
     return " ".join(parts).lower()
 
 

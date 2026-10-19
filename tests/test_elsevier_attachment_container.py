@@ -237,29 +237,35 @@ def test_the_two_copies_agree_on_the_container():
     """
     core = importlib.import_module("scansci_pdf._publisher_strategies_core")
     api = importlib.import_module("scansci_pdf.sources.elsevier_api")
-    payload = _payload()
+    payloads = (
+        _payload(),
+        _nested_id_payload(),
+        _cut_marker_payload(),
+        _wide_container_payload(),
+    )
 
-    core_resolved = _resolve(
-        (
-            "scansci_pdf._publisher_strategies_core",
-            "_elsevier_attachment_container",
-            "_elsevier_attachment_metadata",
-            "_elsevier_attachment_blocks",
-            "_elsevier_eids_in",
-        ),
-        payload,
-    )
-    api_resolved = _resolve(
-        (
-            "scansci_pdf.sources.elsevier_api",
-            "_attachment_container",
-            "_attachment_metadata",
-            "_attachment_blocks",
-            "_eids_in",
-        ),
-        payload,
-    )
-    assert core_resolved == api_resolved
+    for payload in payloads:
+        core_resolved = _resolve(
+            (
+                "scansci_pdf._publisher_strategies_core",
+                "_elsevier_attachment_container",
+                "_elsevier_attachment_metadata",
+                "_elsevier_attachment_blocks",
+                "_elsevier_eids_in",
+            ),
+            payload,
+        )
+        api_resolved = _resolve(
+            (
+                "scansci_pdf.sources.elsevier_api",
+                "_attachment_container",
+                "_attachment_metadata",
+                "_attachment_blocks",
+                "_eids_in",
+            ),
+            payload,
+        )
+        assert core_resolved == api_resolved
 
     # The normalisation of an id to an attachment identity is shared logic.
     for eid in (VOR_EID, AM_EID, "1-s2.0-S0263823116307662"):
@@ -501,3 +507,255 @@ def test_the_same_file_under_two_spellings_is_one_candidate():
 """
     ranked = _extract_elsevier_pdf_attachment_eids(payload)
     assert len(ranked) == 1, f"the same file was offered twice: {ranked}"
+
+
+# --- the second review round ---------------------------------------------- #
+
+# The window and the per-element cap are safety nets. They bound how much
+# metadata reaches the scorer; they must not decide the score.
+
+
+def _cut_marker_payload() -> str:
+    """A label whose marker straddles the per-element cap."""
+    label = "x" * 508 + "aam-pdf" + "y" * 200
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>{AM_EID}</attachment-eid>
+      <label>{label}</label>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+
+
+def _wide_container_payload() -> str:
+    """A container whose decisive marker sits behind a few KB of siblings."""
+    filler = "z" * 375
+    kids = "".join(f"<meta-{i}>{filler}</meta-{i}>" for i in range(12))
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>{VOR_EID}</attachment-eid>
+      {kids}
+      <label>full-text Version of Record</label>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+
+
+def _nested_id_payload() -> str:
+    """A block whose id sits one level down, so the id's parent is not the block.
+
+    Falling back to the id's parent -- the defect #89 was about -- is only
+    visible when the parent is *not* the tight block. With the id as a direct
+    child of the block, both resolutions land on the same node, and a copy
+    that had been reverted would look fine.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <originalText><attachment-eid>{VOR_EID}</attachment-eid></originalText>
+      <attachment-size>1234567</attachment-size>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_a_marker_cut_in_half_by_the_element_cap_still_counts(impl):
+    """The cap must not decide the score.
+
+    A label whose marker straddled the cap used to lose the marker: the
+    scorer could not read it, and the score moved by 60 points. The cap
+    bounds the size of the metadata, not what it says.
+    """
+    metadata = _metadata_by_eid(impl, _cut_marker_payload())
+
+    am = metadata[AM_EID]
+    assert "aam-pdf" in am, "the marker that straddled the cap was lost"
+    # +20 (.pdf) +10 (pdf) +5 (page-count) -60 ("aam-pdf")
+    assert _elsevier_attachment_score(AM_EID, am) == -25
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_the_window_does_not_decide_the_score(impl):
+    """A marker behind a few KB of siblings must survive the window.
+
+    The window used to drop the element that carried the "full-text" claim,
+    and with it the name of the "page-count" element, so the version of
+    record lost the +100 for its own claim.
+    """
+    metadata = _metadata_by_eid(impl, _wide_container_payload())
+
+    vor = metadata[VOR_EID]
+    assert "full-text" in vor, "the version of record lost its own full-text claim"
+    assert "page-count" in vor, "the page-count element's name was lost with it"
+    # +20 (.pdf) +10 (pdf) +100 (full-text) +5 (page-count)
+    assert _elsevier_attachment_score(VOR_EID, vor) == 135
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_the_bounded_metadata_scores_the_same_as_the_unbounded_one(impl):
+    """The bounds must not move the score.
+
+    The same payloads are scored with the bounds in place and with them
+    removed. The two scores have to be identical, or the window decides
+    which file is fetched.
+    """
+    module_name = impl[0]
+    module = importlib.import_module(module_name)
+    cap_name = (
+        "_ELSEVIER_METADATA_PART_CAP"
+        if module_name.endswith("_core")
+        else "_ATTACHMENT_METADATA_PART_CAP"
+    )
+    window_name = (
+        "_ELSEVIER_METADATA_WINDOW"
+        if module_name.endswith("_core")
+        else "_ATTACHMENT_METADATA_WINDOW"
+    )
+    payloads = (_payload(), _cut_marker_payload(), _wide_container_payload())
+
+    bounded: dict[tuple[str, str], int] = {}
+    for payload in payloads:
+        for eid, meta in _metadata_by_eid(impl, payload).items():
+            bounded[(payload, eid)] = _elsevier_attachment_score(eid, meta)
+
+    old_cap = getattr(module, cap_name)
+    old_window = getattr(module, window_name)
+    try:
+        setattr(module, cap_name, 10**9)
+        setattr(module, window_name, 10**9)
+        for payload in payloads:
+            for eid, meta in _metadata_by_eid(impl, payload).items():
+                unbounded = _elsevier_attachment_score(eid, meta)
+                assert bounded[(payload, eid)] == unbounded, (
+                    f"the window moved the score of {eid} from {unbounded} "
+                    f"to {bounded[(payload, eid)]}"
+                )
+    finally:
+        setattr(module, cap_name, old_cap)
+        setattr(module, window_name, old_window)
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_the_metadata_window_bounds_the_output(impl):
+    """A container with a lot of metadata must still be bounded.
+
+    The window is the safety net: without it a pathological container fills
+    the scorer's haystack with megabytes of text.
+    """
+    filler = "n" * 900
+    kids = "".join(f"<note-{i}>{filler}</note-{i}>" for i in range(40))
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>{VOR_EID}</attachment-eid>
+      {kids}
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    metadata = _metadata_by_eid(impl, payload)
+
+    assert len(metadata[VOR_EID]) < 4096, (
+        f"the container's metadata is {len(metadata[VOR_EID])} chars"
+    )
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_an_id_no_block_declares_resolves_to_the_block_naming_the_same_file(impl):
+    """The id may name the file under a spelling no block declares.
+
+    ``1-s2.0-X-main.pdf`` and ``1-s2.0-X.pdf`` are the same attachment, so
+    an id that sits outside every attachment block still resolves to the
+    block that describes the file -- and not to the element that carried it,
+    whose metadata is nothing but the id.
+    """
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachment-eid>1-s2.0-S0263823116307662-main.pdf</attachment-eid>
+  <attachments>
+    <attachment>
+      <attachment-eid>1-s2.0-S0263823116307662.pdf</attachment-eid>
+      <attachment-size>1234567</attachment-size>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    resolved = _resolve(impl, payload)
+    tag, meta = resolved["1-s2.0-S0263823116307662-main.pdf"]
+
+    assert tag == "attachment", f"the container was the {tag} element"
+    assert "attachment-size" in meta, "the block's own metadata was lost"
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_an_id_that_no_block_declares_resolves_to_its_own_element(impl):
+    """The tightest scope there is: the element that carried the id.
+
+    Falling back to the id's *parent* is the defect #89 was about, so the
+    fallback is pinned to the id element itself.
+    """
+    payload = """<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <weird><attachment-eid>1-s2.0-UNKNOWN-main.pdf</attachment-eid></weird>
+</full-text-retrieval-response>
+"""
+    resolved = _resolve(impl, payload)
+    tag, _meta = resolved["1-s2.0-UNKNOWN-main.pdf"]
+
+    assert tag == "attachment-eid", f"the container was the {tag} element"
+
+
+def test_the_two_copies_rank_the_same_candidates():
+    """The drift guard has to compare the *result*, not the helper names.
+
+    Reverting the sources copy's container resolution used to leave every
+    test green: the new test file only drove the core copy's extractor, so
+    the sources copy could be broken without anything noticing.
+    """
+    from scansci_pdf._publisher_strategies_core import (
+        _extract_elsevier_pdf_attachment_eids,
+    )
+    from scansci_pdf.sources.elsevier_api import (
+        _extract_pdf_attachment_eids,
+    )
+
+    payloads = (
+        _payload(),
+        _nested_id_payload(),
+        _cut_marker_payload(),
+        _wide_container_payload(),
+    )
+    for payload in payloads:
+        assert _extract_elsevier_pdf_attachment_eids(payload) == (
+            _extract_pdf_attachment_eids(payload)
+        ), "the two copies ranked the candidates differently"
+
+
+def test_the_two_copies_agree_on_their_constants():
+    """The constants are shared logic too, and they drift silently."""
+    core = importlib.import_module("scansci_pdf._publisher_strategies_core")
+    api = importlib.import_module("scansci_pdf.sources.elsevier_api")
+
+    assert core._ELSEVIER_BLOCK_TAGS == api._ATTACHMENT_BLOCK_TAGS
+    assert core._ELSEVIER_ID_TAGS == api._ATTACHMENT_ID_TAGS
+    assert core._ELSEVIER_METADATA_WINDOW == api._ATTACHMENT_METADATA_WINDOW
+    assert core._ELSEVIER_METADATA_PART_CAP == api._ATTACHMENT_METADATA_PART_CAP
+    assert core._ELSEVIER_METADATA_MARKERS == api._ATTACHMENT_METADATA_MARKERS
+    assert (
+        core._ELSEVIER_ACCEPTED_MANUSCRIPT_MARKERS
+        == api._ACCEPTED_MANUSCRIPT_MARKERS
+    )
