@@ -406,16 +406,27 @@ def _name_survivors(el: ET.Element) -> str:
     """The decisive markers carried by the container's element names.
 
     An element's name -- "page-count", "attachment-size" -- reaches the
-    haystack only through the part it produces, so an element the window
-    drops takes its name with it. The names are collected over the whole
-    subtree, which is cheap: no text is materialised.
+    haystack only through the part it produces, and the builder produces a
+    part only for an element that has text. Reading the name of an element
+    that produced no part would add a marker no version of the metadata
+    ever held: an empty ``<supplementary-material/>`` would demote the
+    version of record on its own.
+
+    The attribute names and values are read the same way -- the builder
+    emits an attribute part only for a non-empty value -- so the survivors
+    are exactly the markers the unbounded metadata holds.
     """
     hits: list[str] = []
     for node in el.iter():
-        hits.extend(_marker_hits(_local_name(str(node.tag))))
+        local = _local_name(str(node.tag))
+        name_hits = _marker_hits(local)
+        if name_hits and _element_text(node):
+            hits.extend(name_hits)
         for attr_name, attr_value in node.attrib.items():
-            hits.extend(_marker_hits(_local_name(str(attr_name))))
-            hits.extend(_marker_hits(str(attr_value)))
+            attr_local = _local_name(str(attr_name))
+            if attr_value:
+                hits.extend(_marker_hits(attr_local))
+                hits.extend(_marker_hits(str(attr_value)))
     if not hits:
         return ""
     return "[markers: " + " ".join(sorted(set(hits))) + "]"

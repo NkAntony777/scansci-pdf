@@ -571,6 +571,35 @@ def _nested_id_payload() -> str:
 
 
 @pytest.mark.parametrize("impl", IMPLS)
+def test_an_element_without_text_does_not_add_a_marker(impl):
+    """A name is a marker only when the element produced a part.
+
+    The metadata builder emits a part for an element only when it has text,
+    so an empty ``<supplementary-material/>`` never reached the haystack in
+    any version of the metadata. Reading its name anyway would demote the
+    version of record by 100 points on the strength of an element that
+    carries no data.
+    """
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>{VOR_EID}</attachment-eid>
+      <attachment-size>1234567</attachment-size>
+      <supplementary-material/>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    metadata = _metadata_by_eid(impl, payload)
+
+    vor = metadata[VOR_EID]
+    assert "supplement" not in vor, "an element without text added a marker"
+    # +20 (.pdf) +10 (pdf) +100 (-main.pdf) +5 (attachment-size)
+    assert _elsevier_attachment_score(VOR_EID, vor) == 135
+
+
+@pytest.mark.parametrize("impl", IMPLS)
 def test_a_marker_cut_in_half_by_the_element_cap_still_counts(impl):
     """The cap must not decide the score.
 
