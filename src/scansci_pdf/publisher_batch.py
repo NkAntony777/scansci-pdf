@@ -2880,7 +2880,15 @@ class PublisherBatchDownloader:
             return True
         if any(marker in title for marker in self.profile.auth_url_markers):
             return True
-        if any(marker.lower() in title for marker in self.profile.auth_title_markers):
+        if any(
+            # Word boundaries, not a bare substring: "Sign In" also occurs
+            # inside "deSIGN IN", and chemistry titles such as "Catalyst
+            # Design in a Single Step" are ordinary entitled article pages.
+            # Matching those as logged out aborts the download of an article
+            # the institution can read.
+            re.search(rf"\b{re.escape(marker.lower())}\b", title)
+            for marker in self.profile.auth_title_markers
+        ):
             return True
         if self._elsevier_has_full_text_access(text):
             return False

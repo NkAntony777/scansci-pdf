@@ -213,6 +213,43 @@ def test_an_entitled_tsinghua_acs_page_is_not_read_as_logged_out():
     assert downloader._looks_logged_out(_FakePage()) is False
 
 
+def test_a_title_marker_does_not_match_inside_a_longer_word():
+    """Title markers are matched on word boundaries, not as bare substrings.
+
+    "Sign In" also occurs inside "deSIGN IN", and titles such as "Catalyst
+    Design in a Single Step" belong to ordinary entitled article pages.
+    Reading those as logged out aborts a download the institution can do.
+    """
+    from scansci_pdf.publisher_batch import PublisherBatchDownloader
+    from scansci_pdf.publisher_profiles import ACS_PROFILE
+
+    class _FakePage:
+        url = "https://pubs.acs.org/doi/10.1021/acs.est.6c00693"
+
+        def __init__(self, title: str):
+            self._title = title
+
+        def title(self):
+            return self._title
+
+        def locator(self, _selector):
+            class _Body:
+                def inner_text(self, timeout=None):
+                    return "Brought to you by Tsinghua University China. Institutional access."
+
+            return _Body()
+
+    downloader = PublisherBatchDownloader({}, profile=ACS_PROFILE)
+    for title in (
+        "Catalyst Design in a Single Step - pubs.acs.org",
+        "How to Resign in a New Light - pubs.acs.org",
+        "Assign in Practice - pubs.acs.org",
+    ):
+        assert downloader._looks_logged_out(_FakePage(title)) is False, title
+    # The genuine logged-out title still has to be detected.
+    assert downloader._looks_logged_out(_FakePage("Sign In - pubs.acs.org")) is True
+
+
 def test_an_explicitly_empty_config_is_not_replaced_by_the_on_disk_config(monkeypatch):
     """``{}`` means "no config", not "no config given"."""
     from scansci_pdf import publisher_batch
