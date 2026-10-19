@@ -45,9 +45,13 @@ TOR_DOWNLOAD_MIRRORS = [
 # Tor Browser version shipping the Expert Bundle. Bump when torproject.org
 # cuts a new stable release -- together with TOR_HASHES, in the same change:
 # the pins are what make a download verifiable, not the version string.
-# 15.0.25 verified 2026-10-14 against the signed manifest at
-# https://dist.torproject.org/torbrowser/15.0.25/sha256sums-signed-build.txt
-# (fetched over HTTPS; the manifest's GPG signature was not verified locally).
+# 15.0.25 pins confirmed 2026-10-19: the four digests below match the
+# Expert Bundle entries in the signed manifest
+# https://tor.eff.org/dist/torbrowser/15.0.25/sha256sums-signed-build.txt,
+# whose GPG signature verifies against the Tor Browser signing key
+# (EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290). The key's identity
+# rests on that fingerprint being Tor's publicly documented signing key.
+# The values are confirmed, not transcribed.
 # 15.0.17 has since been dropped from the dist mirror root, leaving
 # archive.torproject.org as its only surviving mirror.
 TOR_VERSION = "15.0.25"
