@@ -1,32 +1,21 @@
-"""The version of record must win even when the container resolution runs wide.
+"""The version of record must be scored on its own metadata, not its sibling's.
 
-#89 traced a real Elsevier article (``10.1016/j.tws.2017.05.030``) where the
-attachment scorer ranked the accepted manuscript above the version of record
--- and the cause was not the scoring weights. ``_elsevier_attachment_container``
-resolved the two attachments of the *same* article to wildly different nodes:
+#89 traced a real Elsevier article (``10.1016/j.tws.2017.05.030``) whose
+attachment container resolution ran wide: the version of record's container
+was an ancestor spanning the document, so the scorer's haystack held the
+*manuscript's* markers -- ``aam-pdf`` (-60) and ``thumbnail`` (-100) -- as
+well as its own.
 
-    …-main.pdf                                 238,040 chars  (whole article)
-    …-Fatemeh_Azhari_empirical_model_2017.pdf   1,171 chars  (tight block)
+The payload below models that shape: the article-level ``<eid>`` that sits
+outside every attachment block, the two attachment blocks, and a body large
+enough to dominate the metadata of any node that spans it.
 
-The version of record's container was an ancestor spanning the document, so
-its metadata contained the *sibling* attachment's markers -- ``aam-pdf`` (-60)
-and ``thumbnail`` (-100) -- and the correct file scored
-
-    +20 (.pdf) +10 (pdf) +100 (-main.pdf) +5 (page-count) +5 (attachment-size)
-    -100 (thumbnail) -60 (aam-pdf)                                  = -20
-
-while the manuscript, with a tight container, scored
-
-    +20 +10 +5 -60 ("submitted to")                                = -25
-
-The version of record won by five points, and on an article whose manuscript
-carries a "full-text" claim of its own it would have lost outright.
-
-The payload below is a model of that shape -- the article-level ``<eid>`` that
-sits outside every attachment block, the two attachment blocks, and a body
-large enough to dominate the metadata of any node that spans it. The
-``aam-pdf`` and ``thumbnail`` markers live in the body, which is where the
-sibling's markers were in the captured payload.
+The sibling's markers sit at the *head* of the body, not at its tail. The
+metadata window is a few KB, so markers parked behind a 340 KB body would
+fall outside the window and these tests would pass even with the container
+resolution reverted -- which is exactly what happened to the first version
+of this file. The scores asserted below are exact, so a reverted fix moves
+them from 140/-25 to -20/-25.
 """
 
 from __future__ import annotations
@@ -37,7 +26,6 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from scansci_pdf._publisher_strategies_core import _elsevier_attachment_score
-from scansci_pdf.sources import elsevier_api
 
 VOR_EID = "1-s2.0-S0263823116307662-main.pdf"
 AM_EID = "1-s2.0-S0263823116307662-Fatemeh_Azhari_empirical_model_2017.pdf"
@@ -46,17 +34,26 @@ AM_EID = "1-s2.0-S0263823116307662-Fatemeh_Azhari_empirical_model_2017.pdf"
 # the container ran wide. Neither belongs to the version of record.
 SIBLING_MARKERS = ("aam-pdf", "thumbnail")
 
+# +20 (.pdf) +10 (pdf) +100 (-main.pdf) +5 (page-count) +5 (attachment-size)
+VOR_SCORE = 140
+# +20 (.pdf) +10 (pdf) +5 (page-count) -60 ("submitted to")
+AM_SCORE = -25
+
 _BODY_PARAGRAPH = (
     "Post-fire mechanical response of ultra-high strength (Grade 1200) steel "
     "under high temperatures: linking thermal stability and microstructure. "
 )
 
+_SIBLING_MARKER_PARA = (
+    '<ce:para>Supplementary material is served as aam-pdf; a thumbnail '
+    "preview is available for the accepted manuscript.</ce:para>"
+)
+
 
 def _payload() -> str:
     """The modelled Elsevier FULL response for the reported article."""
-    body = (_BODY_PARAGRAPH * 2400) + (
-        '<ce:para>Supplementary material is served as aam-pdf; a thumbnail '
-        "preview is available for the accepted manuscript.</ce:para>"
+    body = _SIBLING_MARKER_PARA + (
+        "<ce:sections>" + (_BODY_PARAGRAPH * 2400) + "</ce:sections>"
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <full-text-retrieval-response xmlns:ce="http://www.elsevier.com/xml/common/dtd">
@@ -79,7 +76,7 @@ def _payload() -> str:
               <page-count>22</page-count>
             </attachment>
           </attachments>
-          <body><ce:sections>{body}</ce:sections></body>
+          <body>{body}</body>
         </full-text-retrieval-response>
       </xocs:full-text-retrieval-response>
     </xocs:doc>
@@ -114,31 +111,43 @@ IMPLS = (
 )
 
 
-def _metadata_by_eid(module_name, container_name, metadata_name, blocks_name,
-                     eids_name, xml_text):
-    """The metadata each candidate attachment is scored with."""
+def _resolve(impl, xml_text):
+    """For every candidate attachment: its container's tag and its metadata."""
+    module_name, container_name, metadata_name, blocks_name, eids_name = impl
     module = importlib.import_module(module_name)
     root = ET.fromstring(xml_text)
     parent_map = {child: parent for parent in root.iter() for child in parent}
     blocks = getattr(module, blocks_name)(root)
 
-    out: dict[str, str] = {}
+    out: dict[str, tuple[str, str]] = {}
     for el in root.iter():
         for eid in getattr(module, eids_name)(el):
             if eid in out:
                 continue
             container = getattr(module, container_name)(el, parent_map, eid, blocks)
-            out[eid] = getattr(module, metadata_name)(container)
+            tag = str(container.tag).split("}")[-1]
+            out[eid] = (tag, getattr(module, metadata_name)(container))
     return out
+
+
+def _metadata_by_eid(impl, xml_text):
+    """The metadata each candidate attachment is scored with."""
+    return {eid: meta for eid, (_tag, meta) in _resolve(impl, xml_text).items()}
+
+
+def _tag_by_eid(impl, xml_text):
+    """The tag of the container each candidate attachment is scored with."""
+    return {eid: tag for eid, (tag, _meta) in _resolve(impl, xml_text).items()}
 
 
 @pytest.mark.parametrize("impl", IMPLS)
 def test_the_version_of_record_is_scored_on_its_own_metadata(impl):
-    """The version of record must not inherit the manuscript's markers."""
-    module_name, container_name, metadata_name, blocks_name, eids_name = impl
-    metadata = _metadata_by_eid(
-        module_name, container_name, metadata_name, blocks_name, eids_name, _payload()
-    )
+    """The version of record must not inherit the manuscript's markers.
+
+    The score is asserted exactly: with the container running wide again the
+    sibling's markers land in the haystack and the score drops to -20.
+    """
+    metadata = _metadata_by_eid(impl, _payload())
 
     vor = metadata[VOR_EID]
     assert vor, "the version of record resolved to no metadata at all"
@@ -146,6 +155,37 @@ def test_the_version_of_record_is_scored_on_its_own_metadata(impl):
         assert marker not in vor, (
             f"the version of record's metadata carries the sibling's {marker!r} marker"
         )
+    assert _elsevier_attachment_score(VOR_EID, vor) == VOR_SCORE
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_the_manuscript_is_still_scored_as_a_manuscript(impl):
+    """The manuscript keeps its own markers, and only its own.
+
+    A fix that simply truncated every container to the same shape would also
+    erase the manuscript's "submitted to" label, which is the marker that
+    makes it a manuscript rather than the version of record.
+    """
+    metadata = _metadata_by_eid(impl, _payload())
+
+    am = metadata[AM_EID]
+    assert "submitted to" in am
+    for marker in SIBLING_MARKERS:
+        assert marker not in am
+    assert _elsevier_attachment_score(AM_EID, am) == AM_SCORE
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_the_container_is_the_attachment_block_itself(impl):
+    """The container must be the block that describes *this* attachment.
+
+    Not the plural ``<attachments>`` holder, and not an ancestor that spans
+    the document: both carry every sibling's metadata.
+    """
+    tags = _tag_by_eid(impl, _payload())
+
+    assert tags[VOR_EID] == "attachment"
+    assert tags[AM_EID] == "attachment"
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -156,10 +196,7 @@ def test_both_containers_stay_tight(impl):
     the same article's two attachments. Both must now be a tight block, of a
     comparable size.
     """
-    module_name, container_name, metadata_name, blocks_name, eids_name = impl
-    metadata = _metadata_by_eid(
-        module_name, container_name, metadata_name, blocks_name, eids_name, _payload()
-    )
+    metadata = _metadata_by_eid(impl, _payload())
 
     vor_len = len(metadata[VOR_EID])
     am_len = len(metadata[AM_EID])
@@ -173,10 +210,7 @@ def test_both_containers_stay_tight(impl):
 @pytest.mark.parametrize("impl", IMPLS)
 def test_the_version_of_record_outranks_the_manuscript(impl):
     """The whole point: the version of record is the file that gets fetched."""
-    module_name, container_name, metadata_name, blocks_name, eids_name = impl
-    metadata = _metadata_by_eid(
-        module_name, container_name, metadata_name, blocks_name, eids_name, _payload()
-    )
+    metadata = _metadata_by_eid(impl, _payload())
 
     vor_score = _elsevier_attachment_score(VOR_EID, metadata[VOR_EID])
     am_score = _elsevier_attachment_score(AM_EID, metadata[AM_EID])
@@ -205,23 +239,27 @@ def test_the_two_copies_agree_on_the_container():
     api = importlib.import_module("scansci_pdf.sources.elsevier_api")
     payload = _payload()
 
-    core_meta = _metadata_by_eid(
-        "scansci_pdf._publisher_strategies_core",
-        "_elsevier_attachment_container",
-        "_elsevier_attachment_metadata",
-        "_elsevier_attachment_blocks",
-        "_elsevier_eids_in",
+    core_resolved = _resolve(
+        (
+            "scansci_pdf._publisher_strategies_core",
+            "_elsevier_attachment_container",
+            "_elsevier_attachment_metadata",
+            "_elsevier_attachment_blocks",
+            "_elsevier_eids_in",
+        ),
         payload,
     )
-    api_meta = _metadata_by_eid(
-        "scansci_pdf.sources.elsevier_api",
-        "_attachment_container",
-        "_attachment_metadata",
-        "_attachment_blocks",
-        "_eids_in",
+    api_resolved = _resolve(
+        (
+            "scansci_pdf.sources.elsevier_api",
+            "_attachment_container",
+            "_attachment_metadata",
+            "_attachment_blocks",
+            "_eids_in",
+        ),
         payload,
     )
-    assert core_meta == api_meta
+    assert core_resolved == api_resolved
 
     # The normalisation of an id to an attachment identity is shared logic.
     for eid in (VOR_EID, AM_EID, "1-s2.0-S0263823116307662"):
@@ -240,3 +278,226 @@ def test_an_article_level_id_and_its_main_pdf_name_one_attachment():
         "1-s2.0-X"
     )
     assert core._elsevier_attachment_key(AM_EID) != core._elsevier_attachment_key(VOR_EID)
+
+
+def test_the_two_copies_expose_the_same_helpers():
+    """The new helpers must exist in both copies under their own names.
+
+    The two copies have drifted before -- only one of them knew about
+    ``web-pdf`` -- so the helper set is pinned by name.
+    """
+    core = importlib.import_module("scansci_pdf._publisher_strategies_core")
+    api = importlib.import_module("scansci_pdf.sources.elsevier_api")
+
+    for core_name, api_name in (
+        ("_elsevier_is_attachment_block", "_is_attachment_block"),
+        ("_elsevier_is_block_element", "_is_block_element"),
+        ("_elsevier_has_block_descendant", "_has_block_descendant"),
+        ("_elsevier_declared_eids", "_declared_eids"),
+        ("_elsevier_declares_file_id", "_declares_file_id"),
+        ("_elsevier_block_is_tight", "_block_is_tight"),
+        ("_elsevier_block_is_scoped", "_block_is_scoped"),
+        ("_elsevier_block_declares", "_block_declares"),
+        ("_elsevier_attachment_blocks", "_attachment_blocks"),
+        ("_elsevier_attachment_container", "_attachment_container"),
+        ("_elsevier_attachment_metadata", "_attachment_metadata"),
+        ("_elsevier_cap_text", "_cap_text"),
+    ):
+        assert hasattr(core, core_name), f"the core copy lost {core_name}"
+        assert hasattr(api, api_name), f"the sources copy lost {api_name}"
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_a_block_tag_is_not_mistaken_for_a_block_element(impl):
+    """``<attachment-size>`` describes nothing; it is not an attachment.
+
+    The loose "the tag name mentions attachment" test would take it for a
+    block, and the walk would stop there with nothing but a number in hand.
+    """
+    module_name, *_ = impl
+    module = importlib.import_module(module_name)
+
+    is_block = getattr(
+        module,
+        "_elsevier_is_block_element" if module_name.endswith("_core") else "_is_block_element",
+    )
+    is_attachment_block = getattr(
+        module,
+        "_elsevier_is_attachment_block"
+        if module_name.endswith("_core")
+        else "_is_attachment_block",
+    )
+
+    root = ET.fromstring(
+        "<attachments><attachment-size>42</attachment-size>"
+        "<attachment-metadata>x</attachment-metadata>"
+        "<attachment><attachment-eid>1-s2.0-X-main.pdf</attachment-eid></attachment>"
+        "</attachments>"
+    )
+    size, meta, block = list(root)
+
+    assert not is_block(size)
+    assert not is_block(meta)
+    assert is_block(block)
+    # The loose test still treats it as attachment-shaped, which is why the
+    # block index uses the explicit list above.
+    assert is_attachment_block(size)
+
+
+# --- regressions the adversarial review found ----------------------------- #
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_a_long_label_does_not_cost_the_version_of_record_its_own_claim(impl):
+    """A 5,000-character label must not push the block's own markers out.
+
+    The metadata window is a few KB. Capping the *total* only would let one
+    long label fill it and cut the block's own "full-text" claim -- which
+    costs the version of record the +100 it had earned from its own id.
+    """
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>1-s2.0-S0263823116307662-mainext.pdf</attachment-eid>
+      <label>{"x" * 5000}</label>
+      <originalText><full-text>Version of Record</full-text></originalText>
+    </attachment>
+    <attachment>
+      <attachment-eid>1-s2.0-S0263823116307662-am.pdf</attachment-eid>
+      <label>accepted manuscript, full-text retrieval version</label>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    metadata = _metadata_by_eid(impl, payload)
+
+    vor = metadata["1-s2.0-S0263823116307662-mainext.pdf"]
+    assert "full-text" in vor, "the version of record lost its own full-text claim"
+    assert len(vor) < 4096
+
+    # +20 (.pdf) +10 (pdf) +100 (the block's own "full-text" claim)
+    assert _elsevier_attachment_score(
+        "1-s2.0-S0263823116307662-mainext.pdf", vor
+    ) == 130
+    # +20 +10 +100 -60 ("accepted manuscript")
+    assert _elsevier_attachment_score(
+        "1-s2.0-S0263823116307662-am.pdf",
+        metadata["1-s2.0-S0263823116307662-am.pdf"],
+    ) == 70
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_a_holder_of_two_blocks_normalising_to_one_key_is_not_a_container(impl):
+    """Two blocks that normalise to one key are still two blocks.
+
+    Counting *keys* would let such a holder look "scoped", and the sibling's
+    metadata would leak back in. The block that names the file id wins.
+    """
+    payload = """<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <eid>1-s2.0-S0263823116307662</eid>
+      <label>supplementary material</label>
+    </attachment>
+    <attachment>
+      <attachment-eid>1-s2.0-S0263823116307662-main.pdf</attachment-eid>
+      <attachment-size>1234567</attachment-size>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    resolved = _resolve(impl, payload)
+    tag, meta = resolved["1-s2.0-S0263823116307662-main.pdf"]
+
+    assert tag == "attachment", f"the holder was used as the container ({tag})"
+    assert "supplementary" not in meta, "the sibling block's label leaked in"
+    assert _elsevier_attachment_score("1-s2.0-S0263823116307662-main.pdf", meta) == 140
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_a_manuscript_block_holding_a_nested_object_keeps_its_label(impl):
+    """A block that also holds something else still describes its own file.
+
+    A nested ``<object>`` makes the block hold more than one attachment, so
+    the strict "scoped to this attachment" test rejects it. Falling back to
+    the id element then throws the block's own label away, and the manuscript
+    stops being recognisable as one.
+    """
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment>
+      <attachment-eid>{VOR_EID}</attachment-eid>
+      <attachment-size>1234567</attachment-size>
+      <page-count>22</page-count>
+    </attachment>
+    <attachment>
+      <attachment-eid>{AM_EID}</attachment-eid>
+      <label>submitted to thin-walled structures this manuscript version is made
+        available under the cc-by-nc-nd 4.0 license</label>
+      <page-count>22</page-count>
+      <object><object-eid>1-s2.0-S0263823116307662-mmc1.pdf</object-eid></object>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    metadata = _metadata_by_eid(impl, payload)
+
+    assert "submitted to" in metadata[AM_EID], "the manuscript's own label was lost"
+    # +20 (.pdf) +10 (pdf) +5 (page-count) -60 ("submitted to")
+    # -100 (the nested object's own "mmc" id marks the block as holding
+    # supplementary material) -- the block legitimately holds it, and the
+    # version of record still wins by a wide margin. What this pins is that
+    # the label survived: without it the score was +30, above the version of
+    # record's, and the manuscript stopped being recognisable as one.
+    assert _elsevier_attachment_score(AM_EID, metadata[AM_EID]) == -125
+    assert _elsevier_attachment_score(VOR_EID, metadata[VOR_EID]) == 140
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_an_id_carried_as_an_attribute_resolves_to_its_own_block(impl):
+    """``<attachment eid="...">`` must resolve to that attachment.
+
+    Starting the search at the id element's *parent* cannot see the id when
+    the id is an attribute of the block itself, and the search then runs up
+    to the ``<attachments>`` holder.
+    """
+    payload = """<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment eid="1-s2.0-S0263823116307662">
+      <attachment-size>1234567</attachment-size>
+      <page-count>22</page-count>
+    </attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    resolved = _resolve(impl, payload)
+    tag, meta = resolved["1-s2.0-S0263823116307662-main.pdf"]
+
+    assert tag == "attachment", f"the holder was used as the container ({tag})"
+    assert _elsevier_attachment_score("1-s2.0-S0263823116307662-main.pdf", meta) == 140
+
+
+def test_the_same_file_under_two_spellings_is_one_candidate():
+    """``1-S2.0-X-MAIN.PDF`` and ``1-s2.0-x-main.pdf`` are one attachment.
+
+    Deduplicating on the raw id string would offer the same file twice.
+    """
+    from scansci_pdf._publisher_strategies_core import (
+        _extract_elsevier_pdf_attachment_eids,
+    )
+
+    payload = """<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response>
+  <attachments>
+    <attachment><attachment-eid>1-S2.0-S0263823116307662-MAIN.PDF</attachment-eid></attachment>
+    <attachment><attachment-eid>1-s2.0-S0263823116307662-main.pdf</attachment-eid></attachment>
+  </attachments>
+</full-text-retrieval-response>
+"""
+    ranked = _extract_elsevier_pdf_attachment_eids(payload)
+    assert len(ranked) == 1, f"the same file was offered twice: {ranked}"

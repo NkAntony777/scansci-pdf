@@ -113,6 +113,22 @@ def _article_eid_to_main_pdf(value: str) -> str:
 # attachment's own metadata needs.
 _ATTACHMENT_METADATA_WINDOW = 4096
 
+# Maximum characters taken from a single element's text. Without it one long
+# element (a 5,000-character label) fills the whole window and pushes the
+# block's *own* markers out of it -- which costs the version of record its
+# own "full-text" claim.
+_ATTACHMENT_METADATA_PART_CAP = 512
+
+# Elements that name an object id rather than hold attachment content.
+_ATTACHMENT_ID_TAGS = frozenset({"attachment-eid", "object-eid", "eid", "identifier"})
+
+# Elements that describe one attachment. The loose "attachment" in the tag
+# name would also match "attachment-size" and "attachment-metadata", which
+# describe nothing, so the index uses this explicit list.
+_ATTACHMENT_BLOCK_TAGS = frozenset({
+    "attachment", "attachments", "object", "objects", "web-pdf",
+})
+
 
 def _attachment_key(eid: str) -> str:
     """Normalise an object id to the identity of the attachment it names.
@@ -156,9 +172,81 @@ def _eids_in(el: ET.Element) -> list[str]:
 
 
 def _is_attachment_block(node: ET.Element) -> bool:
-    """True for a node that names an attachment rather than holding documents."""
+    """True for a node that holds attachment content rather than naming an id.
+
+    ``<attachment-eid>`` and ``<object-eid>`` name an object; they do not
+    hold one, and treating them as blocks would stop the walk at an element
+    whose metadata is nothing but the id.
+    """
     local = _local_name(str(node.tag))
+    if local in _ATTACHMENT_ID_TAGS:
+        return False
     return "attachment" in local or "object" in local or local == "web-pdf"
+
+
+def _is_block_element(node: ET.Element) -> bool:
+    """True for the element that describes one attachment.
+
+    The loose test above would also match ``<attachment-size>`` and
+    ``<attachment-metadata>``, which describe nothing, so the block index
+    uses this explicit list instead.
+    """
+    return _local_name(str(node.tag)) in _ATTACHMENT_BLOCK_TAGS
+
+
+def _has_block_descendant(node: ET.Element) -> bool:
+    """True when the node holds another block: it is a holder, not a block.
+
+    ``<attachments><attachment>...</attachment></attachments>`` is a holder.
+    Its metadata belongs to every attachment inside it, so it must never be
+    used as the container of one of them (#89).
+    """
+    for sub in node.iter():
+        if sub is node:
+            continue
+        if _is_block_element(sub):
+            return True
+    return False
+
+
+def _declared_eids(node: ET.Element) -> list[str]:
+    """Every object id declared inside ``node``."""
+    found: list[str] = []
+    for sub in node.iter():
+        found.extend(_eids_in(sub))
+    return found
+
+
+def _declares_file_id(node: ET.Element) -> bool:
+    """True when the node names a file id itself.
+
+    The article id (``<eid>1-s2.0-X</eid>``) is turned into ``-main.pdf`` on
+    the way in, so a block that only carries the article id describes the
+    file less precisely than one that names the file id itself.
+    """
+    for sub in node.iter():
+        local = _local_name(str(sub.tag))
+        if local in {"attachment-eid", "object-eid"}:
+            if _looks_like_pdf_eid(_element_text(sub)):
+                return True
+        for attr_name, attr_value in sub.attrib.items():
+            attr_local = _local_name(str(attr_name))
+            if attr_local not in {"attachment-eid", "object-eid"}:
+                continue
+            if _looks_like_pdf_eid(str(attr_value).strip()):
+                return True
+    return False
+
+
+def _block_is_tight(node: ET.Element) -> bool:
+    """True when the node declares exactly one attachment.
+
+    Declarations are counted, not normalised keys: the article-level id and
+    the ``-main.pdf`` id name the same version of record, so a holder of two
+    blocks that normalise to one key would pass a key count while still
+    carrying the sibling's metadata.
+    """
+    return len(_declared_eids(node)) == 1
 
 
 def _block_is_scoped(node: ET.Element, key: str) -> bool:
@@ -168,62 +256,83 @@ def _block_is_scoped(node: ET.Element, key: str) -> bool:
     an ancestor spanning the whole article -- carries every sibling's
     metadata, so a sibling's markers leak into this attachment's score (#89).
     """
-    for sub in node.iter():
-        for eid in _eids_in(sub):
-            if _attachment_key(eid) != key:
-                return False
+    for eid in _declared_eids(node):
+        if _attachment_key(eid) != key:
+            return False
     return True
 
 
-def _block_key(node: ET.Element) -> str | None:
-    """The single attachment key a node declares, or None if it declares several.
+def _block_declares(node: ET.Element, key: str) -> bool:
+    """True when the node declares the attachment ``key``.
 
-    A node that declares exactly one attachment is a *tight* block: its
-    metadata describes that attachment alone.
+    Unlike :func:`_block_is_scoped` this tolerates a block that also
+    holds something else -- a nested ``<object>``, say. The block's own label
+    still names the file, and losing it would turn an accepted manuscript
+    back into an ordinary candidate.
     """
-    keys: set[str] = set()
-    for sub in node.iter():
-        for eid in _eids_in(sub):
-            keys.add(_attachment_key(eid))
-            if len(keys) > 1:
-                return None
-    return next(iter(keys)) if keys else None
+    for eid in _declared_eids(node):
+        if _attachment_key(eid) == key:
+            return True
+    return False
 
 
-def _attachment_blocks(root: ET.Element) -> dict[str, ET.Element]:
+def _attachment_blocks(root: ET.Element) -> tuple[dict[str, ET.Element], dict[str, ET.Element]]:
     """Index the tight attachment blocks by the attachment they declare.
 
-    A tight block names an attachment and declares exactly one of them, so its
-    metadata describes that attachment alone. The article-level id sits
-    outside every block, so this index is what describes the version of record
-    it names (#89).
+    Two indexes come back:
+
+    - by the exact object id a block declares, which names the file itself
+      and is therefore the strongest match;
+    - by the normalised attachment key, for the blocks that declare the
+      article id instead of a file id.
+
+    Only *tight* blocks are indexed, and never a holder: a node that
+    declares more than one attachment describes more than one attachment,
+    and a node that holds other blocks describes all of them (#89). A block
+    that names the file id wins over one that merely carries the article
+    id, because it describes the file more precisely.
     """
-    blocks: dict[str, ET.Element] = {}
+    found: list[tuple[str, ET.Element, bool]] = []
     for node in root.iter():
-        if not _is_attachment_block(node):
+        if not _is_block_element(node):
             continue
-        key = _block_key(node)
-        if key is not None:
-            blocks.setdefault(key, node)
-    return blocks
+        if _has_block_descendant(node):
+            continue
+        eids = _declared_eids(node)
+        if len(eids) != 1:
+            continue
+        found.append((eids[0], node, _declares_file_id(node)))
+
+    by_eid: dict[str, ET.Element] = {}
+    by_key: dict[str, ET.Element] = {}
+    for names_file in (True, False):
+        for eid, node, is_file_id in found:
+            if is_file_id != names_file:
+                continue
+            by_eid.setdefault(eid.strip().lower(), node)
+            by_key.setdefault(_attachment_key(eid), node)
+    return by_eid, by_key
 
 
 def _attachment_container(
     el: ET.Element,
     parent_map: dict[ET.Element, ET.Element],
     eid: str,
-    blocks: dict[str, ET.Element],
+    blocks: tuple[dict[str, ET.Element], dict[str, ET.Element]],
 ) -> ET.Element:
     """The node whose metadata describes the attachment named by ``eid``.
 
-    Three candidates, in order of how well they describe *this* attachment:
+    Five candidates, in order of how well they describe *this* attachment:
 
-    1. the nearest ancestor of the element that carried the id which names an
-       attachment and declares no other one;
-    2. the tight block elsewhere in the document that declares this id -- the
-       article-level ``<eid>`` sits outside every attachment block, so the
-       version of record it names is described by that block;
-    3. the element that carried the id, which is the tightest scope there is.
+    1. the tight block that declares this exact object id -- the strongest
+       match, because it names the file rather than the article;
+    2. the nearest ancestor of the element that carried the id which holds
+       exactly one attachment, and that one;
+    3. the nearest ancestor that declares this attachment at all -- the block
+       may also hold a nested object, but its own label still names the file;
+    4. the tight block that declares this attachment's key, for the article
+       id that sits outside every attachment block;
+    5. the element that carried the id, which is the tightest scope there is.
 
     Falling back to the id's *parent*, as this used to, was the defect: the
     parent can be a node spanning the whole article, and the metadata of such
@@ -231,24 +340,59 @@ def _attachment_container(
     """
     key = _attachment_key(eid)
 
-    node = parent_map.get(el, el)
+    by_eid, by_key = blocks
+    block = by_eid.get(eid.strip().lower())
+    if block is not None:
+        return block
+
+    node = el
     while node is not None:
-        if _is_attachment_block(node) and _block_is_scoped(node, key):
+        if (
+            _is_attachment_block(node)
+            and _block_is_tight(node)
+            and _block_is_scoped(node, key)
+        ):
             return node
         node = parent_map.get(node)
 
-    block = blocks.get(key)
+    node = el
+    while node is not None:
+        if _is_attachment_block(node) and _block_declares(node, key):
+            return node
+        node = parent_map.get(node)
+
+    block = by_key.get(key)
     if block is not None:
         return block
     return el
 
 
+def _cap_text(text: str) -> str:
+    """Shorten one element's text to the per-element cap.
+
+    The beginning is kept: the markers the scorer reads ("supplementary",
+    "thumbnail", "accepted manuscript") sit at the head of a label, and a cut
+    through the middle of one would leave the scorer a word it cannot match.
+    """
+    if len(text) <= _ATTACHMENT_METADATA_PART_CAP:
+        return text
+    cut = text[:_ATTACHMENT_METADATA_PART_CAP]
+    space = cut.rfind(" ")
+    if space > _ATTACHMENT_METADATA_PART_CAP // 2:
+        cut = cut[:space]
+    return cut
+
+
 def _attachment_metadata(el: ET.Element) -> str:
     """Metadata of an attachment's container, bounded to a few KB.
 
-    The bound matters because this string is what the scorer matches: a
-    pathological container would otherwise inject a sibling attachment's
-    markers into this attachment's haystack (#89).
+    Two bounds apply. The total keeps a pathological container from filling
+    the scorer's haystack; the per-element cap keeps one long element from
+    pushing the block's own markers out of the window, which would cost the
+    version of record its own "full-text" claim.
+
+    Parts are never cut in half: a part that does not fit is dropped whole,
+    so a marker is never truncated into something the scorer cannot read.
     """
     parts: list[str] = []
     size = 0
@@ -256,18 +400,22 @@ def _attachment_metadata(el: ET.Element) -> str:
         local = _local_name(str(node.tag))
         text = _element_text(node)
         if text:
-            part = f"{local}:{text}"
+            part = f"{local}:{_cap_text(text)}"
+            if size + len(part) + 1 > _ATTACHMENT_METADATA_WINDOW:
+                break
             parts.append(part)
-            size += len(part)
+            size += len(part) + 1
         for attr_name, attr_value in node.attrib.items():
             attr_local = _local_name(str(attr_name))
             if attr_value:
                 part = f"{attr_local}:{attr_value}"
+                if size + len(part) + 1 > _ATTACHMENT_METADATA_WINDOW:
+                    break
                 parts.append(part)
-                size += len(part)
+                size += len(part) + 1
         if size >= _ATTACHMENT_METADATA_WINDOW:
             break
-    return " ".join(parts).lower()[:_ATTACHMENT_METADATA_WINDOW]
+    return " ".join(parts).lower()
 
 
 _ACCEPTED_MANUSCRIPT_MARKERS = (
@@ -326,9 +474,13 @@ def _extract_pdf_attachment_eids(xml_text: str) -> list[str]:
 
     for el in root.iter():
         for eid in _eids_in(el):
-            if eid in seen:
+            # De-duplicate on the attachment identity, not on the spelling:
+            # "1-S2.0-X-MAIN.PDF" and "1-s2.0-x-main.pdf" are one file, and
+            # asking the object store for it twice wastes a request.
+            key = _attachment_key(eid)
+            if key in seen:
                 continue
-            seen.add(eid)
+            seen.add(key)
             container = _attachment_container(el, parent_map, eid, blocks)
             metadata = _attachment_metadata(container)
             candidates.append((_attachment_score(eid, metadata), len(candidates), eid))
