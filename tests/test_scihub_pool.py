@@ -77,8 +77,11 @@ class PersistentPoolTests(unittest.TestCase):
             #
             # Joining the workers is the deterministic way to get there: the
             # close tasks are queued ahead of the executor's shutdown
-            # sentinel, and a worker only exits after it has run them. Polling
-            # for "the first call" instead would snapshot the count at an
+            # sentinel, and a worker only exits after it has run them. So the
+            # join means every close task has run — provided no worker is
+            # stuck for longer than the join timeout, in which case the
+            # assertions below fail rather than the test hanging. Polling for
+            # "the first call" instead would snapshot the count at an
             # arbitrary moment, which is how the bound below used to pass
             # without ever being enforceable.
             for thread in list(pool._threads):
@@ -89,7 +92,19 @@ class PersistentPoolTests(unittest.TestCase):
         self.assertIsNone(scihub._RACE_POOL)
         # Each worker closed its own browser in its own thread.
         self.assertLessEqual(len(own_calls), 2)
-        self.assertTrue(own_calls)
+        self.assertTrue(
+            own_calls,
+            "no close task ran in the pool's workers",
+        )
+        # A close must never run on the main thread: Playwright's sync objects
+        # are thread-affine, so the browser has to be closed by the worker that
+        # owns it. Counting only this pool's workers would hide such a close,
+        # so it is checked separately.
+        self.assertNotIn(
+            threading.main_thread(),
+            calls,
+            "a close ran on the main thread instead of in the pool worker",
+        )
 
     def test_a_close_task_queued_by_another_pool_is_not_counted_against_this_pool(self):
         """Regression: the shutdown measurement must not see another pool's
@@ -111,7 +126,14 @@ class PersistentPoolTests(unittest.TestCase):
             foreign.submit(release.wait)
             foreign.submit(scihub._close_my_browser)
 
+            # The pool under test needs a real worker of its own, otherwise
+            # there is nothing for the filter to match against and every call
+            # would count as foreign. It is deliberately left for the class
+            # cleanup to shut down; the close tasks that cleanup queues land
+            # asynchronously, and the filter is what keeps them out of a
+            # later test's measurement.
             pool = scihub._race_pool({"scihub_browser_workers": 2})
+            pool.submit(threading.get_ident).result()
             calls: list[threading.Thread] = []
 
             def fake_close():
@@ -124,11 +146,16 @@ class PersistentPoolTests(unittest.TestCase):
                 foreign.shutdown(wait=False)
                 for thread in list(foreign._threads):
                     thread.join(timeout=5)
+                # The other direction, in the same patch window: a close issued
+                # by this pool's own worker is counted.
+                pool.submit(scihub._close_my_browser).result()
 
             # The foreign task really did resolve the patched attribute ...
-            self.assertTrue(calls)
-            # ... but it belongs to another pool and must not be counted.
-            self.assertEqual(_own_close_calls(pool, calls), [])
+            self.assertEqual(len(calls), 2)
+            # ... this pool's own close is counted ...
+            self.assertEqual(len(_own_close_calls(pool, calls)), 1)
+            # ... and the foreign one is not.
+            self.assertEqual(len(calls) - len(_own_close_calls(pool, calls)), 1)
         finally:
             release.set()
             foreign.shutdown(wait=False)
